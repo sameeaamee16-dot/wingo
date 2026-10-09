@@ -1,0 +1,12 @@
+SQLAlchemy==2.0.36
+PyMySQL==1.1.1
+opencv-python==4.10.0.84
+Pillow==11.0.0
+pytesseract==0.3.13
+pandas==2.2.3
+matplotlib==3.9.3
+python-dotenv==1.0.1
+openpyxl==3.1.5
+pytest==8.3.4
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
