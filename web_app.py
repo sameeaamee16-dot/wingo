@@ -29,6 +29,7 @@ from ocr.validator import classify_multiplier
 from statistics.analytics import summarize_results
 from statistics.analytics_engine import loss_streaks, overview, patterns, recent_comparison, walk_forward
 from statistics.streak_engine import StreakEngine
+from agent import service as agent_service
 from statistics.wingo_analyzer import analyze_history, classify_number, period_delta, row_is_valid
 import pytesseract
 import re
@@ -769,13 +770,43 @@ def analytics_recent() -> dict:
     return {"threshold": threshold, "records": recent_comparison(values, threshold)}
 
 
+@app.get("/api/agent")
+def agent_view(limit: int = 120) -> dict:
+    """Analyzer agent: settle old signals, learn, issue the next signal, and return UI data."""
+    with analysis_persist_lock:
+        with get_session() as db:
+            rows = list(db.scalars(select(TableCapture).order_by(TableCapture.period, TableCapture.id)))
+            latest_time = rows[-1].captured_at if rows else None
+            fault_query = select(CaptureAudit.id).where(CaptureAudit.status.in_(["INVALID RESULT", "ABNORMAL JUMP"]))
+            if latest_time:
+                fault_query = fault_query.where(CaptureAudit.created_at > latest_time)
+            has_fault = bool(rows) and db.scalar(fault_query.limit(1)) is not None
+            state = agent_service.tick(db, rows, quality_ok=not has_fault, quality_note="Capture validation problem: signals paused until the next clean result")
+            snap = agent_service.snapshot(db, rows, limit)
+            return {
+                "next_period": state["target_period"],
+                "decision": state["decision"],
+                "strategies": [{"name": s["name"], "version": s["version"], "enabled": s["enabled"], "min_matches": s["min_matches"], "min_agreement": s["min_agreement"]} for s in state["strategies"]],
+                "total_results": len(rows),
+                **snap,
+            }
+
+
+@app.post("/api/agent/reset")
+def agent_reset() -> dict:
+    with analysis_persist_lock:
+        with get_session() as db:
+            agent_service.reset_agent(db)
+    return {"ok": True}
+
+
 HTML = r"""
 <!doctype html>
 <html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>WinGo Historical Pattern Analyzer</title>
+  <title>WinGo Pattern Analyzer</title>
   <style>
     :root { color-scheme: dark; font-family: Segoe UI, Arial, sans-serif; background:#11151c; color:#eef2f8; }
     body { margin:0; background:#11151c; }
@@ -784,7 +815,7 @@ HTML = r"""
     button, select, input { background:#263244; border:1px solid #3a4659; color:#f8fafc; border-radius:6px; padding:9px 11px; }
     button { cursor:pointer; font-weight:650; }
     button.primary { background:#f5b814; color:#101319; border-color:#f5b814; }
-    main { display:grid; grid-template-columns: 360px 1fr; gap:14px; padding:14px; }
+    main { display:grid; grid-template-columns: 360px 1fr; gap:14px; padding:14px; align-items:start; }
     section { background:#171d27; border:1px solid #2d3545; border-radius:8px; padding:12px; }
     .controls { display:grid; gap:8px; }
     .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
@@ -821,7 +852,20 @@ HTML = r"""
     @media (max-width:900px) { main { grid-template-columns:1fr; } .signalHero { align-items:flex-start; flex-direction:column; } .mainSignal { text-align:left; } }
     .patternReadout { padding:10px 12px; margin:10px 0; background:#111823; border:1px solid #344055; border-radius:7px; overflow-wrap:anywhere; }
     .tableWrap { max-height:280px; }
-  </style>
+  
+    .full { grid-column:1 / -1; }
+    .kpis { grid-template-columns:repeat(7,minmax(100px,1fr)); margin:0; }
+    @media (max-width:1100px) { .kpis { grid-template-columns:repeat(2,1fr); } }
+    .why { white-space:normal; min-width:320px; color:#bfd2ee; font-size:12px; }
+    .chip { display:inline-block; margin:0 6px 6px 0; padding:4px 9px; border:1px solid #3a4659; border-radius:999px; font-size:12px; background:#202838; }
+    .chip.off { opacity:.45; text-decoration:line-through; }
+    .lesson { border-left:3px solid #3a4659; padding:6px 10px; margin:8px 0; background:#111823; border-radius:0 6px 6px 0; font-size:13px; }
+    .lesson.WIN { border-color:#5eea8a; } .lesson.LOSS { border-color:#ff6b6b; } .lesson.UPGRADE { border-color:#f5b814; } .lesson.DISABLE { border-color:#ff9f43; }
+    .lesson .tag { font-size:10px; font-weight:800; letter-spacing:.08em; }
+    .idea { color:#ffd166; margin-top:3px; }
+    #lessons { max-height:420px; overflow:auto; }
+    .tableWrap { max-height:520px; }
+</style>
 </head>
 <body>
 <header>
@@ -831,19 +875,18 @@ HTML = r"""
 <main>
   <section class="signalPanel">
     <div class="row" style="justify-content:space-between"><h2>Next Period Signal</h2><button id="soundButton" onclick="toggleSignalSound()">Enable Signal Sound</button></div>
-    <p class="muted">Two local analysis agents review rolling result history and pattern continuations. A signal appears only when both agents and the historical evidence agree and data quality is good.</p>
     <div class="signalHero">
-      <div><div class="label">BET FOR NEXT PERIOD</div><div id="nextTarget" class="targetPeriod">Waiting for captured results</div><div class="muted">Derived by incrementing the latest captured period</div></div>
-      <div><div class="label">TWO-AGENT CONSENSUS</div><div id="mainSignal" class="mainSignal noSignal">NO CLEAR SIGNAL</div></div>
+      <div><div class="label">NEXT PERIOD</div><div id="nextTarget" class="targetPeriod">Waiting for captured results</div></div>
+      <div><div class="label">WILL BE</div><div id="mainSignal" class="mainSignal noSignal">NO SIGNAL</div></div>
     </div>
-    <div class="agentGrid" id="agentCards"></div>
-    <div class="grid" id="analysisCards"></div>
-    <p id="analysisStatus" class="notice">Waiting for captured results.</p>
-    <p class="muted">Scores are historical evidence points, not probabilities or a guarantee of the next outcome. Sound alerts play once when a new directional signal appears.</p>
+    <div id="signalWhy" class="patternReadout">Waiting for captured results.</div>
+    <div id="signalEdge" class="muted"></div>
+    <p class="muted">The agent compares the current scenario with every earlier record and signals only when enough past cases agree. Outcomes of a random game cannot be guaranteed; check the “vs 50% chance” card before trusting any signal.</p>
   </section>
+  <div class="grid kpis full" id="kpis"></div>
   <section>
     <h2>Automatic table capture</h2>
-    <p class="muted">Choose the screen or browser tab that shows the results table, then select the table rows.</p>
+    <p class="muted">Choose the browser tab that shows the results table, then select the table rows.</p>
     <div class="controls">
       <button class="primary" onclick="chooseBrowserTab()">Choose Game Browser Tab</button>
       <button onclick="loadScreenshot()">Refresh Selected Tab Preview</button>
@@ -871,36 +914,16 @@ HTML = r"""
       <div id="log"></div>
     </div>
   </section>
-  <div>
-    <section style="margin-top:14px"><h2>Evidence components</h2><div class="tableWrap"><table><thead><tr><th>Indicator</th><th>Historical Big %</th><th>Sample</th><th>Direction</th><th>Applied weight</th></tr></thead><tbody id="componentRows"></tbody></table></div></section>
-    <div class="grid" id="signalKpis"></div>
-    <section style="margin-top:14px">
-      <h2>Historical windows</h2>
-      <div class="tableWrap"><table><thead><tr><th>Window</th><th>Big / Small</th><th>Odd / Even</th><th>High / Low</th><th>Alternate / Repeat</th><th>Current streak</th><th>Longest B / S</th><th>Sample</th></tr></thead><tbody id="windowRows"></tbody></table></div>
-      <p id="trendSummary" class="muted"></p><p id="runSummary" class="muted"></p>
-    </section>
-    <section style="margin-top:14px"><h2>Transition matrix</h2><div class="tableWrap"><table><thead><tr><th>Previous</th><th>Next Big</th><th>Next Small</th><th>Sample</th></tr></thead><tbody id="transitionRows"></tbody></table></div></section>
-    <section style="margin-top:14px"><h2>Number frequency</h2><div class="row"><label class="muted">Window <select id="numberWindow" onchange="refreshNumberFrequency()"><option>5</option><option>10</option><option>20</option><option>30</option><option>50</option><option selected>100</option></select></label></div><div class="tableWrap"><table><thead><tr><th>Number</th><th>Count</th><th>Percentage</th></tr></thead><tbody id="numberRows"></tbody></table></div></section>
-    <section style="margin-top:14px"><h2>Sequence analysis</h2><div class="tableWrap"><table><thead><tr><th>Sequence</th><th>Occurrences</th><th>Followed samples</th><th>Next Big %</th><th>Next Small %</th><th>Sample quality</th></tr></thead><tbody id="sequenceRows"></tbody></table></div></section>
-    <section style="margin-top:14px">
-      <h2>Backtest and reliability</h2><p id="backtestSummary" class="muted">Waiting for enough sequential results.</p>
-      <div class="tableWrap"><table><thead><tr><th>Signal strength</th><th>Tested</th><th>Correct</th><th>Incorrect</th><th>Accuracy</th></tr></thead><tbody id="strengthRows"></tbody></table></div>
-      <h3>Accuracy by historical window</h3><div class="tableWrap"><table><thead><tr><th>Window</th><th>Tested</th><th>Correct</th><th>Incorrect</th><th>Accuracy</th></tr></thead><tbody id="windowAccuracyRows"></tbody></table></div>
-      <p id="conditionsSummary" class="muted"></p>
-      <p id="ocrQuality" class="muted">OCR confidence quality will appear here.</p>
-    </section>
-    <section style="margin-top:14px"><h2>Capture audit</h2><div class="tableWrap"><table><thead><tr><th>Time</th><th>Period</th><th>Status</th><th>Details</th></tr></thead><tbody id="auditRows"></tbody></table></div></section>
-    <section style="margin-top:14px"><h2>Stored analysis by period</h2><div class="tableWrap"><table><thead><tr><th>Analysis period</th><th>Evaluation</th><th>Signal</th><th>Strength</th><th>Sample</th><th>Quality</th><th>Actual period</th><th>Actual result</th><th>Outcome</th></tr></thead><tbody id="analysisRows"></tbody></table></div></section>
-    <section style="margin-top:14px">
-      <h2>Pattern Identifier</h2>
-      <p class="muted">Observed Big/Small sequences and their actual consecutive-period continuations. Counts are historical descriptions, not guarantees.</p>
-      <div class="tableWrap"><table><thead><tr><th>Pattern</th><th>Occurrences</th><th>Next Big</th><th>Next Small</th><th>Matched continuations</th><th>Agreement</th></tr></thead><tbody id="patternRows"></tbody></table></div>
-    </section>
-    <section>
-      <h2>Captured results</h2>
-      <div class="tableWrap"><table><thead><tr><th>Period</th><th>Number</th><th>Big / Small</th><th>Previous period</th><th>Previous result</th><th>OCR confidence</th><th>Data status</th><th>Source</th><th>Captured at</th></tr></thead><tbody id="rows"></tbody></table></div>
-    </section>
-  </div>
+  <section>
+    <div class="row" style="justify-content:space-between"><h2>Agent learning log</h2><button onclick="resetAgent()">Reset agent</button></div>
+    <p class="muted">Every settled signal is explained here. After every 10 settled signals the agent reviews its strategies and only keeps a change if it also works on newer data it was not tuned on.</p>
+    <div id="strategyChips"></div>
+    <div id="lessons"></div>
+  </section>
+  <section class="full">
+    <div class="row" style="justify-content:space-between"><h2>Period records</h2><span id="recordCount" class="muted"></span></div>
+    <div class="tableWrap"><table><thead><tr><th>Period</th><th>Number</th><th>Big / Small</th><th>Signal</th><th>Result</th><th>Why</th></tr></thead><tbody id="records"></tbody></table></div>
+  </section>
 </main>
 <script>
 let shot = {w:0,h:0}, drag = null, selected = null, previewFit = true;
@@ -911,7 +934,6 @@ const regionInputs = ['X','Y','W','H'].map(id => document.getElementById('region
 const captureVideo = document.createElement('video'), captureCanvas = document.createElement('canvas');
 let captureStream = null, captureTimer = null, frameUploadInProgress = false;
 let signalAudio = null, signalSoundEnabled = false, lastSeenSignal = null, firstSignalCheck = true;
-let currentAnalysisData = null;
 captureVideo.muted = true; captureVideo.playsInline = true;
 function log(msg, cls='') { const el=document.getElementById('log'); el.innerHTML = `<div class="${cls}">${new Date().toLocaleTimeString()} ${msg}</div>` + el.innerHTML; }
 async function toggleSignalSound(){
@@ -929,12 +951,6 @@ function playSignalPop(){
   oscillator.type='sine'; oscillator.frequency.setValueAtTime(880,now); oscillator.frequency.exponentialRampToValueAtTime(1320,now+0.07);
   gain.gain.setValueAtTime(0.0001,now); gain.gain.exponentialRampToValueAtTime(0.22,now+0.012); gain.gain.exponentialRampToValueAtTime(0.0001,now+0.16);
   oscillator.connect(gain); gain.connect(signalAudio.destination); oscillator.start(now); oscillator.stop(now+0.17);
-}
-function refreshNumberFrequency(){
-  if(!currentAnalysisData) return;
-  const width=document.getElementById('numberWindow').value;
-  const frequencies=currentAnalysisData.windows[width].number_frequency;
-  document.getElementById('numberRows').innerHTML=Object.entries(frequencies).map(([number,r])=>`<tr><td>${number}</td><td>${r.count}</td><td>${r.percentage}%</td></tr>`).join('');
 }
 function resetSelection(){ selected=null; drag=null; sel.style.display='none'; regionInputs.forEach(input=>input.value=''); }
 function clearSelection(){ resetSelection(); log('Selection cleared.', 'warn'); }
@@ -1059,42 +1075,37 @@ async function testOcr(){
 }
 async function startRecording(){ await fetch('/api/start',{method:'POST'}); log('Recording started','good'); refresh(); }
 async function stopRecording(){ await fetch('/api/stop',{method:'POST'}); log('Recording stopped','warn'); refresh(); }
+const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 async function refresh(){
   const s=await (await fetch('/api/status')).json();
   const status=s.events.some(e=>e.kind==='error')?'OCR ERROR':s.events.some(e=>e.kind==='warning')?'INVALID / ABNORMAL':s.events.some(e=>e.kind==='duplicate')?'DUPLICATE':s.recording?(s.events.some(e=>e.kind==='result')?'CAPTURING':'WAITING'):'STOPPED';
-  document.getElementById('status').textContent=`● ${status}`;
-  document.getElementById('status').className=status==='OCR ERROR'?'bad':['INVALID / ABNORMAL','DUPLICATE','STOPPED'].includes(status)?'warn':'good';
+  const st=document.getElementById('status'); st.textContent=`● ${status}`;
+  st.className=status==='OCR ERROR'?'bad':['INVALID / ABNORMAL','DUPLICATE','STOPPED'].includes(status)?'warn':'good';
   for(const ev of s.events) log(`${ev.kind}: ${ev.message} ${ev.period||''}`,ev.kind==='error'?'bad':ev.kind==='warning'?'warn':'');
-  const d=await (await fetch('/api/results')).json(), a=d.analysis, b=d.backtest;
-  currentAnalysisData=a;
-  document.getElementById('rows').innerHTML=d.results.map(r=>`<tr><td>${r.period}</td><td>${r.number}</td><td>${r.size.toUpperCase()}</td><td>${r.previous_period||'—'}</td><td>${r.previous_number??'—'}</td><td class="${r.confidence<65?'warn':'good'}">${r.confidence.toFixed(1)}%${r.confidence<65?' · REVIEW':''}</td><td class="${r.data_status==='Valid'?'good':'warn'}">${r.data_status}</td><td>${r.source_status}</td><td>${r.time}</td></tr>`).join('');
-  document.getElementById('nextTarget').textContent=a.next_period||'Waiting for captured results';
-  const signalEl=document.getElementById('mainSignal'); signalEl.textContent=a.signal; signalEl.className=`mainSignal ${a.signal==='BIG'?'bigSignal':a.signal==='SMALL'?'smallSignal':'noSignal'}`;
-  document.getElementById('agentCards').innerHTML=(a.agents||[]).map(agent=>`<div class="agentCard"><div class="label">${agent.name}</div><strong class="${agent.signal==='BIG'?'bigSignal':agent.signal==='SMALL'?'smallSignal':'noSignal'}">${agent.signal}</strong><div>${agent.focus}</div><div class="muted">Big/Small evidence: ${agent.big_score} / ${agent.small_score} · Samples: ${agent.sample_size} · Inputs: ${agent.evidence_count}</div></div>`).join('');
-  document.getElementById('analysisCards').innerHTML=[['LAST OBSERVED PERIOD',a.period||'—'],['LAST NUMBER',a.last_result??'—'],['LAST SIZE',a.last_size||'—'],['SIGNAL STRENGTH',a.signal_strength],['DATA QUALITY',a.data_quality],['BIG SCORE',a.big_score],['SMALL SCORE',a.small_score]].map(x=>`<div class="card"><div class="label">${x[0]}</div><div class="value">${x[1]}</div></div>`).join('');
-  const signalKey=a.next_period&&['BIG','SMALL'].includes(a.signal)?`${a.next_period}:${a.signal}`:null;
-  if(firstSignalCheck){lastSeenSignal=signalKey;firstSignalCheck=false;}
-  else if(signalKey&&signalKey!==lastSeenSignal){lastSeenSignal=signalKey;playSignalPop();log(`New signal for period ${a.next_period}: ${a.signal}`,'good');}
-  document.getElementById('analysisStatus').textContent=`${a.signal_status}. ${a.analysis_label} ${a.data_quality_flags.length?a.data_quality_flags.join('; '):'No recent capture-quality flags.'}`;
-  const live=d.live_kpis, liveRate=live.win_rate==null?'—':`${live.win_rate}%`;
-  const liveInterval=live.confidence_interval?`${live.confidence_interval[0]}–${live.confidence_interval[1]}%`:'—';
-  document.getElementById('signalKpis').innerHTML=[['LIVE SIGNALS',live.signals],['LIVE WINS',live.wins],['LIVE LOSSES',live.losses],['LIVE WIN RATE',liveRate],['LIVE 95% INTERVAL',liveInterval],['WALK-FORWARD ACCURACY',`${b.accuracy}%`]].map(x=>`<div class="card"><div class="label">${x[0]}</div><div class="value">${x[1]}</div></div>`).join('');
-  document.getElementById('componentRows').innerHTML=a.components.map(c=>`<tr><td>${c.name}</td><td>${c.big_rate}%</td><td>${c.sample_size}</td><td>${c.direction}</td><td>${Math.round(c.applied_weight*100)}%</td></tr>`).join('')||'<tr><td colspan="5">Insufficient sample for weighted components.</td></tr>';
-  document.getElementById('windowRows').innerHTML=Object.entries(d.windows).map(([name,r])=>`<tr><td>Last ${name}</td><td>${r.big} (${r.big_percentage}%) / ${r.small} (${r.small_percentage}%)</td><td>${r.odd} / ${r.even}</td><td>${r.high} / ${r.low}</td><td>${r.alternation_percentage}% / ${r.repetition_percentage}%</td><td>${r.current_streak.type||'—'} × ${r.current_streak.length}</td><td>${r.longest_streak.Big} / ${r.longest_streak.Small}</td><td>${r.sample_size}${r.available?'':' · incomplete'}</td></tr>`).join('');
-  document.getElementById('trendSummary').textContent=`Recent trend: ${a.recent_trend} · Long-term trend: ${a.long_term_trend} · Last results: ${a.last10.map(r=>r.size==='BIG'?'B':'S').join(' ')||'—'} · Odd/Even ${a.odd_even.odd}/${a.odd_even.even} · High/Low ${a.high_low.high}/${a.high_low.low}.`;
-  document.getElementById('runSummary').textContent=`Current streak: ${a.current_streak.type||'—'} × ${a.current_streak.length} · Longest Big streak: ${a.longest_streak.big} · Longest Small streak: ${a.longest_streak.small} · Alternation ${a.alternation_percentage}% · Repetition ${a.repetition_percentage}%.`;
-  document.getElementById('transitionRows').innerHTML=['Big','Small'].map(previous=>{const r=d.transitions[previous];return `<tr><td>Previous ${previous}</td><td>${r.next_big} (${r.big_percentage}%)</td><td>${r.next_small} (${r.small_percentage}%)</td><td>${r.sample_size}</td></tr>`}).join('');
-  refreshNumberFrequency();
-  document.getElementById('sequenceRows').innerHTML=a.sequence_patterns.map(r=>`<tr><td>${r.pattern}</td><td>${r.occurrences}</td><td>${r.followed_count}</td><td>${r.next_big_percentage}%</td><td>${r.next_small_percentage}%</td><td>${r.quality}</td></tr>`).join('')||'<tr><td colspan="6">No sequence records available.</td></tr>';
-  document.getElementById('backtestSummary').textContent=`Strict walk-forward: ${b.tested} directional signals, ${b.correct} correct, ${b.incorrect} incorrect; ${b.accuracy}% accuracy. Majority-side baseline: ${b.majority_baseline_correct}/${b.majority_baseline_tested} (${b.majority_baseline_accuracy}%). No-signal rounds are excluded from directional accuracy.`;
-  document.getElementById('strengthRows').innerHTML=Object.entries(b.by_signal_strength).map(([strength,r])=>`<tr><td>${strength}</td><td>${r.tested}</td><td>${r.correct}</td><td>${r.incorrect}</td><td>${r.accuracy}%</td></tr>`).join('');
-  document.getElementById('windowAccuracyRows').innerHTML=Object.entries(b.by_window).map(([window,r])=>`<tr><td>Last ${window}</td><td>${r.tested}</td><td>${r.correct}</td><td>${r.incorrect}</td><td>${r.accuracy}%</td></tr>`).join('');
-  document.getElementById('conditionsSummary').textContent=`During streaks ≥3: ${b.during_streak.correct}/${b.during_streak.tested} (${b.during_streak.accuracy}%). During ≥70% alternation windows: ${b.during_alternation.correct}/${b.during_alternation.tested} (${b.during_alternation.accuracy}%). Conflicting-indicator rounds: ${b.conflicting_rounds}; these abstain and are not counted as directional predictions.`;
-  document.getElementById('ocrQuality').textContent=`Data quality ${a.data_quality}: ${d.summary.valid}/${d.summary.total} valid rows; ${d.summary.low_ocr} rows below 65% OCR confidence. ${a.data_quality_flags.join('; ')||'No validation issues in the recent analysis window.'}`;
-  document.getElementById('auditRows').innerHTML=d.audit_events.map(e=>`<tr><td>${e.time}</td><td>${e.period}</td><td>${e.status}</td><td>${e.message}</td></tr>`).join('')||'<tr><td colspan="4">No duplicate, invalid, or abnormal-period audit events.</td></tr>';
-  document.getElementById('analysisRows').innerHTML=d.analysis_records.map(r=>`<tr><td>${r.period}</td><td>${r.mode}</td><td>${r.signal}</td><td>${r.strength}</td><td>${r.sample}</td><td>${r.quality}</td><td>${r.actual_period}</td><td>${r.actual}</td><td>${r.outcome}</td></tr>`).join('');
-  document.getElementById('patternRows').innerHTML=d.patterns.map(r=>`<tr><td>${r.pattern}</td><td>${r.occurrences}</td><td>${r.next_big}</td><td>${r.next_small}</td><td>${r.matched}</td><td>${r.agreement}%</td></tr>`).join('');
+  const d=await (await fetch('/api/agent')).json(), dec=d.decision, k=d.kpis;
+  document.getElementById('nextTarget').textContent=d.next_period||'Waiting for captured results';
+  const sig=document.getElementById('mainSignal'); sig.textContent=dec.signal;
+  sig.className=`mainSignal ${dec.signal==='BIG'?'bigSignal':dec.signal==='SMALL'?'smallSignal':'noSignal'}`;
+  const directional=['BIG','SMALL'].includes(dec.signal);
+  document.getElementById('signalWhy').innerHTML=directional
+    ? `<b>${esc(dec.strategy)}</b> v${dec.version}: scenario “${esc(dec.context)}” appeared <b>${dec.matches}</b> times before and <b>${dec.agreement}%</b> were followed by <b>${dec.signal}</b>.`
+    : esc(dec.status);
+  const edge=dec.edge?` Track record of this strategy: ${dec.wf_hits}/${dec.wf_tested} correct in replay — <b>${esc(dec.edge)}</b>.`:'';
+  document.getElementById('signalEdge').innerHTML=directional?edge:'';
+  const key=directional&&d.next_period?`${d.next_period}:${dec.signal}`:null;
+  if(firstSignalCheck){lastSeenSignal=key;firstSignalCheck=false;}
+  else if(key&&key!==lastSeenSignal){lastSeenSignal=key;playSignalPop();log(`New signal for ${d.next_period}: ${dec.signal}`,'good');}
+  const rate=k.win_rate==null?'—':`${k.win_rate}%`, range=k.interval?`${k.interval[0]}–${k.interval[1]}%`:'—';
+  document.getElementById('kpis').innerHTML=[
+    ['SIGNALS ISSUED',k.signals,''],['WINS',k.wins,'good'],['LOSSES',k.losses,'bad'],['WIN RATE',rate,''],
+    ['95% RANGE',range,''],['PENDING',k.pending,''],['VS 50% CHANCE',k.verdict,k.verdict==='EDGE FOUND'?'good':k.verdict==='WORSE THAN CHANCE'?'bad':'warn']
+  ].map(([l,v,c])=>`<div class="card"><div class="label">${l}</div><div class="value ${c}" style="${String(v).length>8?'font-size:15px;margin-top:10px':''}">${esc(v)}</div></div>`).join('');
+  document.getElementById('strategyChips').innerHTML=d.strategies.map(x=>`<span class="chip ${x.enabled?'':'off'}">${esc(x.name)} v${x.version} · ≥${x.min_matches} matches · ≥${x.min_agreement}%${x.enabled?'':' · OFF'}</span>`).join('');
+  document.getElementById('lessons').innerHTML=d.lessons.map(l=>`<div class="lesson ${l.kind}"><span class="tag">${l.kind}</span> <span class="muted">${esc(l.time)}</span><div>${esc(l.text)}</div>${l.idea?`<div class="idea">Upgrade idea: ${esc(l.idea)}</div>`:''}</div>`).join('')||'<p class="muted">No lessons yet. Every settled signal will be explained here.</p>';
+  document.getElementById('recordCount').textContent=`${d.total_results} captured results`;
+  document.getElementById('records').innerHTML=d.records.map(r=>`<tr><td>${esc(r.period)}</td><td>${r.number}</td><td class="${r.size==='BIG'?'bigSignal':'smallSignal'}">${r.size}</td><td>${esc(r.signal)}</td><td class="${r.outcome==='WIN'?'good':r.outcome==='LOSS'?'bad':'muted'}">${esc(r.outcome)}</td><td class="why">${esc(r.reason)}</td></tr>`).join('')||'<tr><td colspan="6">Waiting for captured results.</td></tr>';
 }
+async function resetAgent(){ if(!confirm('Erase all agent signals, lessons and strategy upgrades and restart from defaults?')) return; await fetch('/api/agent/reset',{method:'POST'}); log('Agent reset to default strategies','warn'); refresh(); }
 refresh(); setInterval(refresh, 1500);
 </script>
 </body>
