@@ -159,3 +159,49 @@ class CaptureAudit(Base):
     message: Mapped[str] = mapped_column(String(240), nullable=False)
     source_status: Mapped[str] = mapped_column(String(24), default="OCR", nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
+class AgentStrategy(Base):
+    __tablename__ = "agent_strategies"
+    __table_args__ = (UniqueConstraint("name", name="uq_agent_strategies_name"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(32), nullable=False)
+    version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    params: Mapped[str] = mapped_column(Text, nullable=False)  # JSON: kind, k, min_matches, min_agreement
+    enabled: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
+
+
+class AgentSignal(Base):
+    __tablename__ = "agent_signals"
+    __table_args__ = (UniqueConstraint("target_period", name="uq_agent_signals_target_period"), Index("ix_agent_signals_issued_at", "issued_at"))
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    target_period: Mapped[str] = mapped_column(String(64), nullable=False)
+    strategy_name: Mapped[str] = mapped_column(String(32), nullable=False)
+    strategy_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    predicted: Mapped[str] = mapped_column(String(8), nullable=False)
+    context: Mapped[str] = mapped_column(String(120), nullable=False)
+    matches: Mapped[int] = mapped_column(Integer, nullable=False)
+    agreement: Mapped[Decimal] = mapped_column(Numeric(5, 1), nullable=False)
+    issued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    actual_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    actual_size: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    outcome: Mapped[str | None] = mapped_column(String(16), nullable=True)  # WIN / LOSS / SKIPPED
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class AgentLesson(Base):
+    __tablename__ = "agent_lessons"
+    __table_args__ = (Index("ix_agent_lessons_created_at", "created_at"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    signal_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    kind: Mapped[str] = mapped_column(String(12), nullable=False)  # WIN / LOSS / UPGRADE / DISABLE / NOCHANGE / REVIEW
+    strategy_name: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    cause: Mapped[str | None] = mapped_column(String(48), nullable=True)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    upgrade_idea: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
