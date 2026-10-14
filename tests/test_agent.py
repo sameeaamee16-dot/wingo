@@ -103,3 +103,25 @@ def test_data_quality_gate_blocks_new_signals(db):
     out = service.tick(db, rows_of(db), quality_ok=False, quality_note="paused")
     assert out["decision"]["signal"] == "NO SIGNAL"
     assert not list(db.scalars(select(AgentSignal)))
+
+
+def test_diagnose_explains_every_blocker():
+    seg = [list("BSBSBSBS" * 6)]
+    seg[0][-3:] = list("BBB")
+    rows = engine.diagnose(engine.DEFAULT_STRATEGIES, seg)
+    assert len(rows) == 4 and all(r["blocker"] for r in rows)
+    off = engine.diagnose([{**engine.DEFAULT_STRATEGIES[0], "enabled": False}], seg)
+    assert "OFF" in off[0]["blocker"]
+
+
+def test_upgrades_cannot_exceed_bounds():
+    s = {**engine.DEFAULT_STRATEGIES[0], "min_matches": engine.MAX_MIN_MATCHES, "min_agreement": engine.MAX_MIN_AGREEMENT}
+    for n in engine._neighbors(s):
+        assert n["min_matches"] <= engine.MAX_MIN_MATCHES and n["min_agreement"] <= engine.MAX_MIN_AGREEMENT
+
+
+def test_tick_reports_health_and_reasons_when_silent(db):
+    feed(db, letters(300))
+    out = service.tick(db, rows_of(db), quality_ok=True)
+    d = out["decision"]
+    assert d["health"]["results"] == 300 and len(d["diagnostics"]) == 4
