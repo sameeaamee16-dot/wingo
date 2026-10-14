@@ -863,6 +863,8 @@ HTML = r"""
     .lesson.WIN { border-color:#5eea8a; } .lesson.LOSS { border-color:#ff6b6b; } .lesson.UPGRADE { border-color:#f5b814; } .lesson.DISABLE { border-color:#ff9f43; }
     .lesson .tag { font-size:10px; font-weight:800; letter-spacing:.08em; }
     .idea { color:#ffd166; margin-top:3px; }
+    .diag { font-size:12px; color:#9fb2cc; margin-top:8px; line-height:1.6; }
+    .diag b { color:#e6edf7; }
     #lessons { max-height:420px; overflow:auto; }
     .tableWrap { max-height:520px; }
 </style>
@@ -881,6 +883,7 @@ HTML = r"""
     </div>
     <div id="signalWhy" class="patternReadout">Waiting for captured results.</div>
     <div id="signalEdge" class="muted"></div>
+    <div id="diag" class="diag"></div>
     <p class="muted">The agent compares the current scenario with every earlier record and signals only when enough past cases agree. Outcomes of a random game cannot be guaranteed; check the “vs 50% chance” card before trusting any signal.</p>
   </section>
   <div class="grid kpis full" id="kpis"></div>
@@ -1092,6 +1095,9 @@ async function refresh(){
     : esc(dec.status);
   const edge=dec.edge?` Track record of this strategy: ${dec.wf_hits}/${dec.wf_tested} correct in replay — <b>${esc(dec.edge)}</b>.`:'';
   document.getElementById('signalEdge').innerHTML=directional?edge:'';
+  const h=dec.health||{}, ageTxt=h.seconds_since_last_capture==null?'—':h.seconds_since_last_capture>300?`<span class="bad">${Math.round(h.seconds_since_last_capture/60)} min ago — capture may have stopped</span>`:`${h.seconds_since_last_capture}s ago`;
+  document.getElementById('diag').innerHTML=`<b>Data health:</b> ${h.results||0} results · ${h.clean_tail||0} clean in a row · last capture ${ageTxt} · latest OCR confidence ${h.latest_confidence??'—'}% · validation ${h.quality_ok?'<span class="good">OK</span>':'<span class="bad">PAUSED</span>'}`+
+    (directional?'':'<br><b>Why no signal:</b> '+(dec.diagnostics||[]).map(x=>`${esc(x.name)}: ${esc(x.blocker)}${x.context!=='—'?` (scenario “${esc(x.context)}”)`:''}`).join(' · '));
   const key=directional&&d.next_period?`${d.next_period}:${dec.signal}`:null;
   if(firstSignalCheck){lastSeenSignal=key;firstSignalCheck=false;}
   else if(key&&key!==lastSeenSignal){lastSeenSignal=key;playSignalPop();log(`New signal for ${d.next_period}: ${dec.signal}`,'good');}
