@@ -25,6 +25,8 @@ DEFAULT_STRATEGIES: list[dict[str, Any]] = [
 MIN_HISTORY = 30          # valid consecutive results needed before any signal
 EVOLVE_EVERY = 10         # review strategies after this many settled signals
 MIN_VALIDATION_TESTS = 20 # minimum out-of-sample tests to accept a change
+MAX_MIN_MATCHES = 20      # upgrades may never demand more matches than this
+MAX_MIN_AGREEMENT = 75.0  # ...or more agreement than this, so a strategy cannot tune itself silent
 DISABLE_MIN_TESTS = 40    # minimum tests before a strategy can be switched off
 
 
@@ -148,6 +150,40 @@ def edge_label(hits: int, tested: int) -> str:
     return "NOT PROVEN"
 
 
+def diagnose(strategies: Sequence[dict[str, Any]], segments: Sequence[Sequence[str]]) -> list[dict[str, Any]]:
+    """For every strategy, say exactly why it is (not) firing right now."""
+    tail = list(segments[-1]) if segments else []
+    out: list[dict[str, Any]] = []
+    for strategy in strategies:
+        entry: dict[str, Any] = {"name": strategy["name"], "enabled": bool(strategy.get("enabled", True)), "context": "—", "matches": 0, "agreement": None}
+        if not entry["enabled"]:
+            entry["blocker"] = "switched OFF by the agent (it was provably worse than chance)"
+            out.append(entry)
+            continue
+        key = context_key(strategy, tail, len(tail))
+        if key is None:
+            entry["blocker"] = f"needs {int(strategy['k'])} clean consecutive results, only {len(tail)} available since the last gap"
+            out.append(entry)
+            continue
+        big, small = build_counts(strategy, segments).get(key, (0, 0))
+        n = big + small
+        entry.update(context=describe_context(strategy, key), matches=n, agreement=round(max(big, small) * 100 / n, 1) if n else None)
+        if n == 0:
+            entry["blocker"] = "this exact scenario has never appeared before"
+        elif n < int(strategy["min_matches"]):
+            entry["blocker"] = f"only {n} past matches, needs {int(strategy['min_matches'])}"
+        elif big == small:
+            entry["blocker"] = "past cases are split 50/50"
+        elif entry["agreement"] < float(strategy["min_agreement"]):
+            entry["blocker"] = f"past cases agree only {entry['agreement']}%, needs {float(strategy['min_agreement']):g}%"
+        elif wilson(max(big, small), n)[0] <= 0.5:
+            entry["blocker"] = f"{entry['agreement']}% over {n} cases is still within coin-flip luck"
+        else:
+            entry["blocker"] = "ready"
+        out.append(entry)
+    return out
+
+
 def issue_signal(strategies: Sequence[dict[str, Any]], segments: Sequence[Sequence[str]]) -> dict[str, Any]:
     """Compare the current scenario with all earlier records and decide."""
     total = sum(len(s) for s in segments)
@@ -214,11 +250,11 @@ def _neighbors(strategy: dict[str, Any]) -> list[dict[str, Any]]:
     out = []
     for dm in (-2, 2):
         m = int(strategy["min_matches"]) + dm
-        if 3 <= m <= 40:
+        if 3 <= m <= MAX_MIN_MATCHES:
             out.append({**strategy, "min_matches": m})
     for da in (-3.0, 3.0):
         a = float(strategy["min_agreement"]) + da
-        if 52 <= a <= 90:
+        if 55 <= a <= MAX_MIN_AGREEMENT:
             out.append({**strategy, "min_agreement": a})
     return out
 

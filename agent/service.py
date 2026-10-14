@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import timezone
 from decimal import Decimal
 from typing import Any, Sequence
 
@@ -138,6 +139,14 @@ def tick(db, rows: Sequence[Any], quality_ok: bool, quality_note: str = "") -> d
             if chosen:
                 wf = engine.walk_forward(chosen, segments)
                 decision.update(wf_tested=wf["tested"], wf_hits=wf["hits"], edge=engine.edge_label(wf["hits"], wf["tested"]))
+    age = None
+    if rows and getattr(rows[-1], "captured_at", None) is not None:
+        captured = rows[-1].captured_at
+        captured = captured if captured.tzinfo else captured.replace(tzinfo=timezone.utc)
+        age = int((utc_now() - captured).total_seconds())
+    decision["health"] = {"results": len(rows), "clean_tail": len(segments[-1]) if segments else 0, "seconds_since_last_capture": age,
+                          "quality_ok": bool(quality_ok), "latest_confidence": float(rows[-1].confidence) if rows and rows[-1].confidence is not None else None}
+    decision["diagnostics"] = engine.diagnose(strategies, segments) if rows else []
     return {"target_period": target, "decision": decision, "strategies": strategies}
 
 
